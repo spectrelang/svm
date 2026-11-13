@@ -1,0 +1,368 @@
+/// svm: the Spectre toolchain version manager.
+
+val allocators = use("std/allocators")
+val cstr       = use("std/string/cstr")
+val os         = use("std/os")
+val stdio      = use("std/stdio")
+val str        = use("std/string")
+val install    = use("install.sx")
+val remote     = use("remote.sx")
+val store      = use("store.sx")
+val version    = use("version.sx")
+
+fn print_usage() void = {
+    stdio.puts("svm - Spectre version manager")
+    stdio.puts("")
+    stdio.puts("usage:")
+    stdio.puts("  svm <command> [arguments]")
+    stdio.puts("")
+    stdio.puts("commands:")
+    stdio.puts("  install <version|latest>  Install a Spectre version")
+    stdio.puts("  switch  <version|latest>  Install if needed and activate a version")
+    stdio.puts("  list                      List installed versions")
+    stdio.puts("  list-remote               List versions available to install")
+    stdio.puts("  current                   Print the active version")
+    stdio.puts("  uninstall <version>       Remove an installed version")
+    stdio.puts("  help                      Show this help message")
+    stdio.puts("")
+    stdio.puts("Set SVM_HOME to override the state directory (default: ~/.svm).")
+}
+
+fn print_error(message: ref u8) void = trust {
+    if message == none {
+        stdio.puts("svm: error: unknown error\n")
+        return
+    }
+    stdio.print("svm: error: {s}\n", {message})
+}
+
+fn arg(args: list[ref u8], index: i64) option[ref u8] = trust {
+    return @get(args, index as usize)
+}
+
+fn cmd_install(ac: allocators.ListArena, args: list[ref u8]) i32 = trust {
+    val requested = arg(args, 2)
+    val requested_value: mut ref u8 = none
+    match requested {
+        none => {
+            stdio.puts("svm: error: install requires a version or 'latest'\n")
+            return 1
+        }
+        some value => {
+            requested_value = value
+        }
+    }
+
+    match store.open[allocators.ListArena](ac) {
+        err e => {
+            print_error(e)
+            return 1
+        }
+        ok state => {
+            match install.install[allocators.ListArena](
+                ac,
+                state,
+                str.from_cstr(requested_value)
+            ) {
+                err e => {
+                    print_error(e)
+                    return 1
+                }
+                ok installed => {
+                    if installed.already {
+                        stdio.print("{s} is already installed\n", {installed.version})
+                    } else {
+                        stdio.print("Installed Spectre {s}\n", {installed.version})
+                    }
+
+                    val active = store.active_version[allocators.ListArena](ac, state)
+                    val needs_activation: mut bool = false
+                    if active is none {
+                        needs_activation = true
+                    }
+                    if active is some active_version {
+                        if !store.is_installed[allocators.ListArena](
+                            ac,
+                            state,
+                            active_version
+                        ) {
+                            needs_activation = true
+                        }
+                    }
+                    if needs_activation {
+                        match store.activate[allocators.ListArena](
+                            ac,
+                            state,
+                            installed.version
+                        ) {
+                            err e => {
+                                stdio.print("warning: {s}\n", {e})
+                                return 0
+                            }
+                            ok _ => {
+                                stdio.print(
+                                    "Activated Spectre {s}\n",
+                                    {installed.version}
+                                )
+                            }
+                        }
+                    }
+                    return 0
+                }
+            }
+        }
+    }
+}
+
+fn cmd_switch(ac: allocators.ListArena, args: list[ref u8]) i32 = trust {
+    val requested = arg(args, 2)
+    match requested {
+        none => {
+            stdio.puts("svm: error: switch requires a version or 'latest'\n")
+            return 1
+        }
+        some requested_value => {
+            match store.open[allocators.ListArena](ac) {
+                err e => {
+                    print_error(e)
+                    return 1
+                }
+                ok state => {
+                    match install.install[allocators.ListArena](
+                        ac,
+                        state,
+                        str.from_cstr(requested_value)
+                    ) {
+                        err e => {
+                            print_error(e)
+                            return 1
+                        }
+                        ok installed => {
+                            if !installed.already {
+                                stdio.print(
+                                    "Installed Spectre {s}\n",
+                                    {installed.version}
+                                )
+                            }
+                            match store.activate[allocators.ListArena](
+                                ac,
+                                state,
+                                installed.version
+                            ) {
+                                err e => {
+                                    print_error(e)
+                                    return 1
+                                }
+                                ok _ => {
+                                    stdio.print(
+                                        "Switched to Spectre {s}\n",
+                                        {installed.version}
+                                    )
+                                    return 0
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn cmd_list(ac: allocators.ListArena) i32 = trust {
+    match store.open[allocators.ListArena](ac) {
+        err e => {
+            print_error(e)
+            return 1
+        }
+        ok state => {
+            match store.installed[allocators.ListArena](ac, state) {
+                err e => {
+                    print_error(e)
+                    return 1
+                }
+                ok versions => {
+                    if (@len(versions) as i64) == 0 {
+                        stdio.eputs("no versions installed; run 'svm install latest'\n")
+                        return 0
+                    }
+                    val active = store.active_version[allocators.ListArena](
+                        ac,
+                        state
+                    )
+                    for item in versions {
+                        val is_active: mut bool = false
+                        if active is some active_version {
+                            if cstr.eql(active_version, item) {
+                                is_active = true
+                            }
+                        }
+                        if is_active {
+                            stdio.print("* ", {})
+                        } else {
+                            stdio.print("  ", {})
+                        }
+                        stdio.puts(str.from_cstr(item))
+                    }
+                    return 0
+                }
+            }
+        }
+    }
+}
+
+fn cmd_list_remote(ac: allocators.ListArena) i32 = trust {
+    match remote.list[allocators.ListArena](ac) {
+        err e => {
+            print_error(e)
+            return 1
+        }
+        ok versions => {
+            for item in versions {
+                stdio.puts(str.from_cstr(item))
+            }
+            return 0
+        }
+    }
+}
+
+fn cmd_current(ac: allocators.ListArena) i32 = trust {
+    match store.open[allocators.ListArena](ac) {
+        err e => {
+            print_error(e)
+            return 1
+        }
+        ok state => {
+            val active = store.active_version[allocators.ListArena](ac, state)
+            if active is some active_version {
+                stdio.puts(str.from_cstr(active_version))
+                return 0
+            }
+            stdio.eputs("svm: error: no active version; run 'svm switch <version>'\n")
+            return 1
+        }
+    }
+}
+
+fn cmd_uninstall(ac: allocators.ListArena, args: list[ref u8]) i32 = trust {
+    val requested = arg(args, 2)
+    val requested_value: mut ref u8 = none
+    match requested {
+        none => {
+            stdio.puts("svm: error: uninstall requires a version\n")
+            return 1
+        }
+        some value => {
+            requested_value = value
+        }
+    }
+
+    val canonical = version.canonical[allocators.ListArena](
+        ac,
+        str.from_cstr(requested_value)
+    )
+    val version_text: mut ref u8 = none
+    match canonical {
+        none => {
+            stdio.puts("svm: error: invalid version; expected vX.Y.Z\n")
+            return 1
+        }
+        some value => {
+            version_text = value
+        }
+    }
+
+    match store.open[allocators.ListArena](ac) {
+        err e => {
+            print_error(e)
+            return 1
+        }
+        ok state => {
+            match store.uninstall[allocators.ListArena](
+                ac,
+                state,
+                version_text
+            ) {
+                err e => {
+                    print_error(e)
+                    return 1
+                }
+                ok _ => {
+                    stdio.print("Uninstalled Spectre {s}\n", {version_text})
+                    return 0
+                }
+            }
+        }
+    }
+}
+
+fn dispatch(ac: allocators.ListArena, args: list[ref u8]) i32 = trust {
+    val command = arg(args, 1)
+    val command_value: mut ref u8 = none
+    match command {
+        none => {
+            print_usage()
+            return 1
+        }
+        some value => {
+            command_value = value
+        }
+    }
+    val name: str.StringView = str.from_cstr(command_value)
+
+    if str.eql_cstr(name, c"install") {
+        return cmd_install(ac, args)
+    }
+    if str.eql_cstr(name, c"switch") {
+        return cmd_switch(ac, args)
+    }
+    if str.eql_cstr(name, c"list") {
+        return cmd_list(ac)
+    }
+    if str.eql_cstr(name, c"list-remote") {
+        return cmd_list_remote(ac)
+    }
+    if str.eql_cstr(name, c"current") {
+        return cmd_current(ac)
+    }
+    if str.eql_cstr(name, c"uninstall") {
+        return cmd_uninstall(ac, args)
+    }
+    if str.eql_cstr(name, c"help")
+    || str.eql_cstr(name, c"-h")
+    || str.eql_cstr(name, c"--help") {
+        print_usage()
+        return 0
+    }
+
+    stdio.print("svm: error: unknown command '{s}'\n", {command_value})
+    print_usage()
+    return 1
+}
+
+pub fn main() i32 = trust {
+    val args = os.get_args()
+    val argc: i64 = @len(args) as i64
+    if argc < 2 {
+        print_usage()
+        return 1
+    }
+
+    val arena_result = allocators.ScopedArena.new(131072 as usize)
+    val arena: mut allocators.ScopedArenaAllocator = none
+    match arena_result {
+        err _ => {
+            stdio.puts("svm: error: out of memory\n")
+            return 1
+        }
+        ok value => {
+            arena = value
+        }
+    }
+    val ac: allocators.ListArena = {arena: arena}
+    defer {
+        allocators.ScopedArena.free(arena)
+    }
+
+    return dispatch(ac, args)
+}

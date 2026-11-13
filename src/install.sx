@@ -1,0 +1,296 @@
+/// Installation of a Spectre version through the tag's own fw/install.sh.
+
+val allocators = use("std/allocators")
+val fs         = use("std/fs")
+val os         = use("std/os")
+val path       = use("std/path")
+val stdio      = use("std/stdio")
+val str        = use("std/string")
+val time       = use("std/time")
+val remote     = use("remote.sx")
+val store      = use("store.sx")
+val util       = use("util.sx")
+val version    = use("version.sx")
+
+pub type InstallResult = {
+    version: ref u8
+    already: bool
+}
+
+fn cleanup(tmp: ref u8) void = trust {
+    if os.exists(tmp) {
+        fs.remove_dir_all(str.from_cstr(tmp))
+    }
+}
+
+fn fail(
+    tmp: ref u8,
+    message: ref u8
+) result[InstallResult, ref u8] = trust {
+    cleanup(tmp)
+    return err message
+}
+
+fn build_path[A: allocators.GeneralAllocator](
+    ac: A,
+    base: ref u8,
+    suffix: ref u8
+) ref u8 = trust {
+    val buf: mut util.Buf = util.buf_new[A](ac, 4096)
+    util.buf_append_cstr(buf, base)
+    util.buf_append_cstr(buf, suffix)
+    if !util.buf_ok(buf) {
+        return none
+    }
+    return util.buf_cstr(buf)
+}
+
+fn resolve[A: allocators.GeneralAllocator](
+    ac: A,
+    requested: str.StringView
+) result[ref u8, ref u8] = trust {
+    val text: str.StringView = str.trim(requested)
+    if str.eql_cstr(text, c"latest") {
+        match remote.latest[A](ac) {
+            err e => {
+                return err e
+            }
+            ok value => {
+                return ok value
+            }
+        }
+    }
+
+    val canonical = version.canonical[A](ac, text)
+    if canonical is some value {
+        return ok value
+    }
+    return err c"invalid version; expected vX.Y.Z or latest"
+}
+
+/// Install a version by running the tag's `fw/install.sh` in an isolated HOME.
+///
+/// The script's system prefix and sudo use are redirected into the staging
+/// tree so that installing a toolchain never modifies the host system.
+pub fn install[A: allocators.GeneralAllocator](
+    ac: A,
+    state: store.Store,
+    requested: str.StringView
+) result[InstallResult, ref u8] = trust {
+    val resolved: mut ref u8 = none
+    match resolve[A](ac, requested) {
+        err e => {
+            return err e
+        }
+        ok value => {
+            resolved = value
+        }
+    }
+
+    match store.ensure(state) {
+        err e => {
+            return err e
+        }
+        ok _ => {
+        }
+    }
+
+    if store.is_installed[A](ac, state, resolved) {
+        return ok InstallResult{version: resolved, already: true}
+    }
+
+    if !os.in_path(c"git") {
+        return err c"git is required but was not found in PATH"
+    }
+
+    val tmp_buf: mut util.Buf = util.buf_new[A](ac, 4096)
+    util.buf_append_cstr(tmp_buf, state.tmp)
+    util.buf_append_cstr(tmp_buf, c"/")
+    util.buf_append_cstr(tmp_buf, resolved)
+    util.buf_append_cstr(tmp_buf, c"-")
+    util.buf_append_i64(tmp_buf, time.unix_now_millis())
+    if !util.buf_ok(tmp_buf) {
+        return err c"could not allocate a temporary directory path"
+    }
+    val tmp: ref u8 = util.buf_cstr(tmp_buf)
+    if !path.ensure_dir(str.from_cstr(tmp)) {
+        return err c"could not create a temporary directory"
+    }
+
+    val stage: ref u8 = build_path[A](ac, tmp, c"/home")
+    val src: ref u8 = build_path[A](ac, tmp, c"/home/.local/src/spectre")
+    if stage == none || src == none {
+        return fail(tmp, c"could not allocate installation paths")
+    }
+    if !path.ensure_dir(str.from_cstr(stage)) {
+        return fail(tmp, c"could not create the staging directory")
+    }
+
+    stdio.print("Installing Spectre {s}...\n", {resolved})
+
+    val tag_arg: ref u8 = util.quote[A](ac, str.from_cstr(resolved))
+    val repo_arg: ref u8 = util.quote[A](ac, str.from_cstr(remote.repo()))
+    val src_arg: ref u8 = util.quote[A](ac, str.from_cstr(src))
+    if tag_arg == none || repo_arg == none || src_arg == none {
+        return fail(tmp, c"could not allocate the clone command")
+    }
+
+    val clone_cmd: mut util.Buf = util.buf_new[A](ac, 16384)
+    util.buf_append_cstr(clone_cmd, c"git clone --depth 1 --branch ")
+    util.buf_append_cstr(clone_cmd, tag_arg)
+    util.buf_append_cstr(clone_cmd, c" ")
+    util.buf_append_cstr(clone_cmd, repo_arg)
+    util.buf_append_cstr(clone_cmd, c" ")
+    util.buf_append_cstr(clone_cmd, src_arg)
+    if !util.buf_ok(clone_cmd) {
+        return fail(tmp, c"could not allocate the clone command")
+    }
+    if os.run(util.buf_cstr(clone_cmd)) != 0 {
+        return fail(tmp, c"could not clone the requested Spectre version")
+    }
+
+    val shim_dir: ref u8 = build_path[A](ac, tmp, c"/shim")
+    val sudo_src: ref u8 = build_path[A](ac, tmp, c"/sudo-script")
+    val sudo_dst: ref u8 = build_path[A](ac, tmp, c"/shim/sudo")
+    if shim_dir == none || sudo_src == none || sudo_dst == none {
+        return fail(tmp, c"could not allocate the sandbox paths")
+    }
+    if !path.ensure_dir(str.from_cstr(shim_dir)) {
+        return fail(tmp, c"could not create the sandbox directory")
+    }
+    val sudo_script: str.StringView = "#!/bin/sh\nif [ \"$1\" = \"ldconfig\" ]; then\n    exit 0\nfi\nexec \"$@\"\n"
+    if !fs.write_all(str.from_cstr(sudo_src), sudo_script) {
+        return fail(tmp, c"could not create the sandbox helper")
+    }
+    if !store.copy_executable[A](ac, sudo_src, sudo_dst) {
+        return fail(tmp, c"could not prepare the sandbox helper")
+    }
+
+    val patched_install: ref u8 = build_path[A](ac, tmp, c"/install.sh")
+    val source_install: ref u8 = build_path[A](ac, src, c"/fw/install.sh")
+    if patched_install == none || source_install == none {
+        return fail(tmp, c"could not allocate the patched install script path")
+    }
+    val source_install_arg: ref u8 = util.quote[A](
+        ac,
+        str.from_cstr(source_install)
+    )
+    val patched_install_arg: ref u8 = util.quote[A](
+        ac,
+        str.from_cstr(patched_install)
+    )
+    if source_install_arg == none || patched_install_arg == none {
+        return fail(tmp, c"could not allocate the install script arguments")
+    }
+
+    val patch_cmd: mut util.Buf = util.buf_new[A](ac, 16384)
+    util.buf_append_cstr(
+        patch_cmd,
+        c"sed 's|OTHER_PREFIX=\"/usr/local\"|OTHER_PREFIX=\"${HOME}/.local\"|g; s|OTHER_PREFIX=\"/opt/homebrew\"|OTHER_PREFIX=\"${HOME}/.local\"|g' "
+    )
+    util.buf_append_cstr(patch_cmd, source_install_arg)
+    util.buf_append_cstr(patch_cmd, c" > ")
+    util.buf_append_cstr(patch_cmd, patched_install_arg)
+    if !util.buf_ok(patch_cmd) {
+        return fail(tmp, c"could not allocate the install script command")
+    }
+    if os.run(util.buf_cstr(patch_cmd)) != 0 {
+        return fail(tmp, c"could not prepare the install script")
+    }
+
+    val stage_arg: ref u8 = util.quote[A](ac, str.from_cstr(stage))
+    val src_dir_arg: ref u8 = util.quote[A](ac, str.from_cstr(src))
+    val shim_arg: ref u8 = util.quote[A](ac, str.from_cstr(shim_dir))
+    if stage_arg == none || src_dir_arg == none || shim_arg == none {
+        return fail(tmp, c"could not allocate the install command")
+    }
+
+    val install_cmd: mut util.Buf = util.buf_new[A](ac, 16384)
+    util.buf_append_cstr(install_cmd, c"cd ")
+    util.buf_append_cstr(install_cmd, src_dir_arg)
+    util.buf_append_cstr(install_cmd, c" && HOME=")
+    util.buf_append_cstr(install_cmd, stage_arg)
+    util.buf_append_cstr(install_cmd, c" PATH=")
+    util.buf_append_cstr(install_cmd, shim_arg)
+    util.buf_append_cstr(install_cmd, c":$PATH sh ")
+    util.buf_append_cstr(install_cmd, patched_install_arg)
+    util.buf_append_cstr(install_cmd, c" -v ")
+    util.buf_append_cstr(install_cmd, tag_arg)
+    util.buf_append_cstr(install_cmd, c" -minimal")
+    if !util.buf_ok(install_cmd) {
+        return fail(tmp, c"could not allocate the install command")
+    }
+    if os.run(util.buf_cstr(install_cmd)) != 0 {
+        return fail(tmp, c"the selected version failed to build")
+    }
+
+    val installed_bin: ref u8 = build_path[A](
+        ac,
+        stage,
+        c"/.local/bin/spectre"
+    )
+    val installed_lib: ref u8 = build_path[A](
+        ac,
+        stage,
+        c"/.local/bin/spectrelib"
+    )
+    if installed_bin == none || installed_lib == none {
+        return fail(tmp, c"could not allocate the installed paths")
+    }
+    if !os.exists(installed_bin) || !os.exists(installed_lib) {
+        return fail(tmp, c"the install script did not produce a complete toolchain")
+    }
+
+    val version_dir = store.version_dir[A](ac, state, resolved)
+    val version_bin_dir = store.version_bin_dir[A](ac, state, resolved)
+    if !path.ensure_dir(str.from_cstr(version_bin_dir)) {
+        return fail(tmp, c"could not create the version directory")
+    }
+
+    val dest_bin = store.version_binary[A](ac, state, resolved)
+    val dest_lib = store.version_stdlib[A](ac, state, resolved)
+    if !store.copy_executable[A](ac, installed_bin, dest_bin) {
+        fs.remove_dir_all(str.from_cstr(version_dir))
+        return fail(tmp, c"could not install the spectre binary")
+    }
+    if !os.copy_dir_recursive(installed_lib, dest_lib) {
+        fs.remove_dir_all(str.from_cstr(version_dir))
+        return fail(tmp, c"could not install the standard library")
+    }
+
+    val stage_uqbe: ref u8 = build_path[A](
+        ac,
+        stage,
+        c"/.local/bin/uqbe"
+    )
+    if stage_uqbe != none && os.exists(stage_uqbe) {
+        val dest_uqbe = store.active_uqbe[A](ac, state)
+        if os.exists(dest_uqbe) {
+            fs.delete(str.from_cstr(dest_uqbe))
+        }
+        if !store.copy_executable[A](ac, stage_uqbe, dest_uqbe) {
+            stdio.puts("warning: could not install uqbe into the svm bin directory\n")
+        }
+    }
+
+    val stage_qbe: ref u8 = build_path[A](
+        ac,
+        stage,
+        c"/.local/bin/qbe"
+    )
+    if stage_qbe != none && os.exists(stage_qbe) {
+        val dest_qbe = store.active_qbe[A](ac, state)
+        if os.exists(dest_qbe) {
+            fs.delete(str.from_cstr(dest_qbe))
+        }
+        if !store.copy_executable[A](ac, stage_qbe, dest_qbe) {
+            stdio.puts("warning: could not install qbe into the svm bin directory\n")
+        }
+    }
+
+    cleanup(tmp)
+    post {
+        version_installed: store.is_installed[A](ac, state, resolved)
+    }
+    return ok InstallResult{version: resolved, already: false}
+}

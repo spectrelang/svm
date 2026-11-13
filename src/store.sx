@@ -1,0 +1,399 @@
+/// On-disk state for installed Spectre toolchains.
+
+val allocators = use("std/allocators")
+val cstr       = use("std/string/cstr")
+val fs         = use("std/fs")
+val os         = use("std/os")
+val path       = use("std/path")
+val str        = use("std/string")
+val version    = use("version.sx")
+val util       = use("util.sx")
+
+val BINARY_NAME: ref u8 = c"spectre"
+val RUNTIME_NAME: ref u8 = c"spectrelib"
+val UQBE_NAME: ref u8 = c"uqbe"
+val QBE_NAME: ref u8 = c"qbe"
+
+pub type Store = {
+    root: ref u8
+    versions: ref u8
+    bin: ref u8
+    tmp: ref u8
+    active: ref u8
+}
+
+fn copy_cstr[A: allocators.GeneralAllocator](
+    ac: A,
+    text: str.StringView
+) ref u8 = trust {
+    val raw_opt = allocators.alloc_in[A](ac, (text.len + 1) as usize)
+    match raw_opt {
+        none => {
+            return none
+        }
+        some raw => {
+            val out: ref u8 = raw as ref u8
+            if text.len > 0 {
+                @memcpy(out, text.ptr as ref void, text.len as usize)
+            }
+            @store8(@ptradd(out, text.len), 0)
+            return out
+        }
+    }
+}
+
+fn dir_sep() u8 = {
+    when windows {
+        return 92
+    }
+    return 47
+}
+
+fn join[A: allocators.GeneralAllocator](
+    ac: A,
+    base: ref u8,
+    child: ref u8
+) ref u8 = trust {
+    val sep: u8 = dir_sep()
+    val base_len: i64 = cstr.len(base)
+    val child_len: i64 = cstr.len(child)
+    val base_end: mut i64 = base_len
+    for {
+        if base_end <= 0 {
+            break
+        }
+        if !path.is_path_sep(@load8(@ptradd(base, base_end - 1))) {
+            break
+        }
+        base_end--
+    }
+
+    val need_sep: mut i64 = 0
+    if base_end > 0 && child_len > 0
+    && !path.is_path_sep(@load8(child)) {
+        need_sep = 1
+    }
+    val out_len: i64 = base_end + need_sep + child_len
+    val raw_opt = allocators.alloc_in[A](ac, (out_len + 1) as usize)
+    match raw_opt {
+        none => {
+            return none
+        }
+        some raw => {
+            val out: ref u8 = raw as ref u8
+            if base_end > 0 {
+                @memcpy(out, base as ref void, base_end as usize)
+            }
+            if need_sep == 1 {
+                @store8(@ptradd(out, base_end), sep)
+            }
+            if child_len > 0 {
+                @memcpy(
+                    @ptradd(out, base_end + need_sep),
+                    child as ref void,
+                    child_len as usize
+                )
+            }
+            @store8(@ptradd(out, out_len), 0)
+            return out
+        }
+    }
+}
+
+/// Resolve the store layout, honouring `SVM_HOME` when it is set.
+pub fn open[A: allocators.GeneralAllocator](
+    ac: A
+) result[Store, ref u8] = trust {
+    val root: mut ref u8 = none
+    val env_root = os.env(c"SVM_HOME")
+    if env_root is some configured {
+        if cstr.len(configured) > 0 {
+            root = copy_cstr[A](ac, str.from_cstr(configured))
+        }
+    }
+
+    if root == none {
+        val home_opt = fs.home_dir[A](ac)
+        match home_opt {
+            none => {
+                return err c"could not determine the home directory"
+            }
+            some home => {
+                root = join[A](ac, home, c".svm")
+            }
+        }
+    }
+
+    if root == none {
+        return err c"could not allocate the state directory path"
+    }
+
+    val versions = join[A](ac, root, c"versions")
+    val bin = join[A](ac, root, c"bin")
+    val tmp = join[A](ac, root, c"tmp")
+    val active = join[A](ac, root, c"active")
+    if versions == none || bin == none || tmp == none || active == none {
+        return err c"could not allocate the state directory paths"
+    }
+
+    return ok Store{
+        root: root,
+        versions: versions,
+        bin: bin,
+        tmp: tmp,
+        active: active
+    }
+}
+
+/// Create the state directories required by install and switch.
+pub fn ensure(state: Store) result[void, ref u8] = trust {
+    if !path.ensure_dir(str.from_cstr(state.root)) {
+        return err c"could not create the svm state directory"
+    }
+    if !path.ensure_dir(str.from_cstr(state.versions)) {
+        return err c"could not create the versions directory"
+    }
+    if !path.ensure_dir(str.from_cstr(state.bin)) {
+        return err c"could not create the bin directory"
+    }
+    if !path.ensure_dir(str.from_cstr(state.tmp)) {
+        return err c"could not create the temporary directory"
+    }
+    return ok ()
+}
+
+pub fn version_dir[A: allocators.GeneralAllocator](
+    ac: A,
+    state: Store,
+    version_text: ref u8
+) ref u8 = trust {
+    pre {
+        version_present: version_text != none
+    }
+    return join[A](ac, state.versions, version_text)
+}
+
+pub fn version_bin_dir[A: allocators.GeneralAllocator](
+    ac: A,
+    state: Store,
+    version_text: ref u8
+) ref u8 = trust {
+    return join[A](ac, version_dir[A](ac, state, version_text), c"bin")
+}
+
+pub fn version_binary[A: allocators.GeneralAllocator](
+    ac: A,
+    state: Store,
+    version_text: ref u8
+) ref u8 = trust {
+    return join[A](ac, version_bin_dir[A](ac, state, version_text), BINARY_NAME)
+}
+
+pub fn version_stdlib[A: allocators.GeneralAllocator](
+    ac: A,
+    state: Store,
+    version_text: ref u8
+) ref u8 = trust {
+    return join[A](ac, version_bin_dir[A](ac, state, version_text), RUNTIME_NAME)
+}
+
+pub fn active_binary[A: allocators.GeneralAllocator](
+    ac: A,
+    state: Store
+) ref u8 = trust {
+    return join[A](ac, state.bin, BINARY_NAME)
+}
+
+pub fn active_stdlib[A: allocators.GeneralAllocator](
+    ac: A,
+    state: Store
+) ref u8 = trust {
+    return join[A](ac, state.bin, RUNTIME_NAME)
+}
+
+pub fn active_uqbe[A: allocators.GeneralAllocator](
+    ac: A,
+    state: Store
+) ref u8 = trust {
+    return join[A](ac, state.bin, UQBE_NAME)
+}
+
+pub fn active_qbe[A: allocators.GeneralAllocator](
+    ac: A,
+    state: Store
+) ref u8 = trust {
+    return join[A](ac, state.bin, QBE_NAME)
+}
+
+/// Read the active version, if one has been selected.
+pub fn active_version[A: allocators.GeneralAllocator](
+    ac: A,
+    state: Store
+) option[ref u8] = trust {
+    if !os.exists(state.active) {
+        return none
+    }
+    val data_opt = fs.read_all[A](ac, str.from_cstr(state.active))
+    match data_opt {
+        none => {
+            return none
+        }
+        some raw => {
+            val text: str.StringView = str.trim(str.from_cstr(raw as ref u8))
+            if text.len == 0 {
+                return none
+            }
+            val copy = copy_cstr[A](ac, text)
+            if copy == none {
+                return none
+            }
+            return some copy
+        }
+    }
+}
+
+/// Copy an executable and make sure it is runnable.
+pub fn copy_executable[A: allocators.GeneralAllocator](
+    ac: A,
+    src: ref u8,
+    dst: ref u8
+) bool = trust {
+    if !os.copy_file(src, dst) {
+        return false
+    }
+    when posix {
+        val quoted = util.quote[A](ac, str.from_cstr(dst))
+        if quoted == none {
+            return false
+        }
+        val cmd: mut util.Buf = util.buf_new[A](ac, 4096)
+        util.buf_append_cstr(cmd, c"chmod 755 ")
+        util.buf_append_cstr(cmd, quoted)
+        if !util.buf_ok(cmd) {
+            return false
+        }
+        if os.run(util.buf_cstr(cmd)) != 0 {
+            return false
+        }
+    }
+    return true
+}
+
+/// Activate an installed version by refreshing the shared `bin` directory.
+pub fn activate[A: allocators.GeneralAllocator](
+    ac: A,
+    state: Store,
+    version_text: ref u8
+) result[void, ref u8] = trust {
+    pre {
+        version_present: version_text != none
+    }
+    val src_bin = version_binary[A](ac, state, version_text)
+    val src_lib = version_stdlib[A](ac, state, version_text)
+    if !os.exists(src_bin) || !os.exists(src_lib) {
+        return err c"that version is not fully installed"
+    }
+
+    match ensure(state) {
+        err e => {
+            return err e
+        }
+        ok _ => {
+        }
+    }
+
+    val dst_bin = active_binary[A](ac, state)
+    val dst_lib = active_stdlib[A](ac, state)
+    if os.exists(dst_bin) {
+        if !fs.delete(str.from_cstr(dst_bin)) {
+            return err c"could not replace the active spectre binary"
+        }
+    }
+    if os.exists(dst_lib) {
+        if !fs.remove_dir_all(str.from_cstr(dst_lib)) {
+            return err c"could not replace the active standard library"
+        }
+    }
+
+    if !copy_executable[A](ac, src_bin, dst_bin) {
+        return err c"could not install the active spectre binary"
+    }
+    if !os.copy_dir_recursive(src_lib, dst_lib) {
+        return err c"could not install the active standard library"
+    }
+    if !fs.write_all(str.from_cstr(state.active), str.from_cstr(version_text)) {
+        return err c"could not record the active version"
+    }
+    post {
+        active_binary_present: os.exists(dst_bin)
+    }
+    return ok ()
+}
+
+pub fn is_installed[A: allocators.GeneralAllocator](
+    ac: A,
+    state: Store,
+    version_text: ref u8
+) bool = trust {
+    val binary = version_binary[A](ac, state, version_text)
+    val runtime = version_stdlib[A](ac, state, version_text)
+    return os.exists(binary) && os.exists(runtime)
+}
+
+/// Return installed versions newest-first.
+pub fn installed[A: allocators.GeneralAllocator](
+    ac: A,
+    state: Store
+) result[list[ref u8], ref u8] = trust {
+    val out: mut list[ref u8] = @listalloc[A, ref u8](ac)?
+    if !fs.is_directory(str.from_cstr(state.versions)) {
+        return ok out
+    }
+
+    val entries_opt = fs.walk_dir_cstr[A](ac, state.versions)
+    match entries_opt {
+        none => {
+            return err c"could not read the versions directory"
+        }
+        some entries => {
+            for name in entries {
+                if version.parse(str.from_cstr(name)) is none {
+                    continue
+                }
+                if is_installed[A](ac, state, name) {
+                    @append(out, name)
+                }
+            }
+        }
+    }
+
+    version.sort_desc(out)
+    return ok out
+}
+
+/// Remove an installed version, refusing to remove the active one.
+pub fn uninstall[A: allocators.GeneralAllocator](
+    ac: A,
+    state: Store,
+    version_text: ref u8
+) result[void, ref u8] = trust {
+    pre {
+        version_present: version_text != none
+    }
+    if !is_installed[A](ac, state, version_text) {
+        return err c"that version is not installed"
+    }
+
+    val active_opt = active_version[A](ac, state)
+    if active_opt is some active {
+        if cstr.eql(active, version_text) {
+            return err c"cannot uninstall the active version; switch to another version first"
+        }
+    }
+
+    val dir = version_dir[A](ac, state, version_text)
+    if !fs.remove_dir_all(str.from_cstr(dir)) {
+        return err c"could not remove the version directory"
+    }
+    return ok ()
+}

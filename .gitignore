@@ -1,0 +1,7 @@
+SPECTRE_LANGUAGE_REFERENCE.md
+lib/
+svm-dev
+svm
+std__*
+s-out/
+docs-out*/

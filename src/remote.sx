@@ -1,0 +1,159 @@
+/// Discovery of Spectre toolchain versions from the project's git tags.
+
+val allocators = use("std/allocators")
+val cstr       = use("std/string/cstr")
+val os         = use("std/os")
+val ostr       = use("std/string/owned")
+val str        = use("std/string")
+val version    = use("version.sx")
+val util       = use("util.sx")
+
+val DEFAULT_REPO: ref u8 = c"https://github.com/spectrelang/spectre.git"
+val TAG_MARKER: ref u8 = c"refs/tags/"
+
+pub fn repo() ref u8 = trust {
+    val configured = os.env(c"SVM_SPECTRE_REPO")
+    if configured is some value {
+        if cstr.len(value) > 0 {
+            return value
+        }
+    }
+    return DEFAULT_REPO
+}
+
+fn copy_view[A: allocators.GeneralAllocator](
+    ac: A,
+    text: str.StringView
+) ref u8 = trust {
+    val raw_opt = allocators.alloc_in[A](ac, (text.len + 1) as usize)
+    match raw_opt {
+        none => {
+            return none
+        }
+        some raw => {
+            val out: ref u8 = raw as ref u8
+            if text.len > 0 {
+                @memcpy(out, text.ptr as ref void, text.len as usize)
+            }
+            @store8(@ptradd(out, text.len), 0)
+            return out
+        }
+    }
+}
+
+fn append_tags[A: allocators.GeneralAllocator](
+    ac: A,
+    text: str.StringView,
+    out: mut list[ref u8]
+) bool = trust {
+    val marker: str.StringView = str.from_cstr(TAG_MARKER)
+    val marker_len: i64 = marker.len
+    val i: mut i64 = 0
+    val line_start: mut i64 = 0
+
+    for {
+        val at_end: bool = i == text.len
+        if at_end || @load8(@ptradd(text.ptr, i)) == 10 {
+            val line: str.StringView = str.trim(
+                str.slice(text, line_start, i)
+            )
+            if line.len > 0 {
+                val found = str.find(line, marker)
+                if found is some marker_at {
+                    val tag: str.StringView = str.trim(
+                        str.slice(line, marker_at + marker_len, line.len)
+                    )
+                    if version.parse(tag) is some _ {
+                        val canonical = version.canonical[A](ac, tag)
+                        if canonical is some value {
+                            @append(out, value)
+                        } else {
+                            return false
+                        }
+                    }
+                }
+            }
+            line_start = i + 1
+        }
+        if at_end {
+            break
+        }
+        i++
+    }
+    return true
+}
+
+/// List remote versions newest-first.
+pub fn list[A: allocators.GeneralAllocator](
+    ac: A
+) result[list[ref u8], ref u8] = trust {
+    if !os.in_path(c"git") {
+        return err c"git is required but was not found in PATH"
+    }
+
+    val out: mut list[ref u8] = @listalloc[A, ref u8](ac)?
+    val repo_arg = util.quote[A](ac, str.from_cstr(repo()))
+    if repo_arg == none {
+        return err c"could not allocate the repository argument"
+    }
+
+    val cmd: mut util.Buf = util.buf_new[A](ac, 4096)
+    util.buf_append_cstr(cmd, c"git ls-remote --tags --refs ")
+    util.buf_append_cstr(cmd, repo_arg)
+    util.buf_append_cstr(cmd, c" 'v*' 2>&1")
+    if !util.buf_ok(cmd) {
+        return err c"could not allocate the git command"
+    }
+
+    val exec_result = os.exec(util.buf_cstr(cmd))
+    match exec_result {
+        err _ => {
+            return err c"could not run git ls-remote"
+        }
+        ok captured => {
+            val text: str.StringView = str.view(
+                captured.ptr,
+                ostr.len(captured)
+            )
+            val parsed: bool = append_tags[A](ac, text, out)
+            if !parsed {
+                ostr.free(captured)
+                return err c"out of memory while reading remote versions"
+            }
+            if (@len(out) as i64) == 0 {
+                val diagnostic: str.StringView = str.trim(text)
+                if diagnostic.len > 0 {
+                    val message = copy_view[A](ac, diagnostic)
+                    ostr.free(captured)
+                    if message != none {
+                        return err message
+                    }
+                    return err c"git returned no Spectre version tags"
+                }
+                ostr.free(captured)
+                return err c"git returned no Spectre version tags; check the repository and network"
+            }
+            ostr.free(captured)
+            version.sort_desc(out)
+            return ok out
+        }
+    }
+}
+
+/// Resolve the newest remote version.
+pub fn latest[A: allocators.GeneralAllocator](
+    ac: A
+) result[ref u8, ref u8] = trust {
+    match list[A](ac) {
+        err e => {
+            return err e
+        }
+        ok versions => {
+            val first_opt = @get(versions, 0 as usize)
+            if first_opt is some first {
+                return ok (first as ref u8)
+            }
+            return err c"no remote versions are available"
+        }
+    }
+}

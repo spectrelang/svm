@@ -1,0 +1,212 @@
+/// Version parsing, canonicalisation, and ordering for svm.
+
+val allocators = use("std/allocators")
+val str        = use("std/string")
+
+pub type Version = {
+    major: i64
+    minor: i64
+    patch: i64
+    invariant {
+        major >= 0
+        minor >= 0
+        patch >= 0
+    }
+}
+
+type Part = {
+    value: i64
+    next: i64
+}
+
+fn is_digit(c: u8) bool = {
+    return c >= 48 && c <= 57
+}
+
+fn parse_part(text: str.StringView, start: i64) option[Part] = trust {
+    pre {
+        start_nonnegative: start >= 0
+    }
+    if start >= text.len {
+        return none
+    }
+
+    val i: mut i64 = start
+    val value: mut i64 = 0
+    val digits: mut i64 = 0
+    for {
+        if i >= text.len {
+            break
+        }
+        val c: u8 = @load8(@ptradd(text.ptr, i))
+        if !is_digit(c) {
+            break
+        }
+        val digit: i64 = (c - 48) as i64
+        if value > 922337203685477580 {
+            return none
+        }
+        if value == 922337203685477580 && digit > 7 {
+            return none
+        }
+        value = value * 10 + digit
+        i++
+        digits++
+    }
+
+    if digits == 0 {
+        return none
+    }
+    return some Part{value: value, next: i}
+}
+
+/// Parse a version such as `v0.0.15` or `0.0.15`.
+pub fn parse(text: str.StringView) option[Version] = trust {
+    pre {
+        text_valid: text.ptr != none || text.len == 0
+    }
+    val t: str.StringView = str.trim(text)
+    val start: mut i64 = 0
+    if t.len > 0 && @load8(t.ptr) == 118 {
+        start = 1
+    }
+
+    val first_opt = parse_part(t, start)
+    match first_opt {
+        none => {
+            return none
+        }
+        some first => {
+            if first.next >= t.len
+            || @load8(@ptradd(t.ptr, first.next)) != 46 {
+                return none
+            }
+            val second_opt = parse_part(t, first.next + 1)
+            match second_opt {
+                none => {
+                    return none
+                }
+                some second => {
+                    if second.next >= t.len
+                    || @load8(@ptradd(t.ptr, second.next)) != 46 {
+                        return none
+                    }
+                    val third_opt = parse_part(t, second.next + 1)
+                    match third_opt {
+                        none => {
+                            return none
+                        }
+                        some third => {
+                            if third.next != t.len {
+                                return none
+                            }
+                            return some Version{
+                                major: first.value,
+                                minor: second.value,
+                                patch: third.value
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return none
+}
+
+pub fn cmp(a: Version, b: Version) i64 = {
+    if a.major != b.major {
+        return a.major - b.major
+    }
+    if a.minor != b.minor {
+        return a.minor - b.minor
+    }
+    return a.patch - b.patch
+}
+
+pub fn cmp_text(a: str.StringView, b: str.StringView) i64 = trust {
+    val a_opt = parse(a)
+    val b_opt = parse(b)
+    if a_opt is some av {
+        if b_opt is some bv {
+            return cmp(av, bv)
+        }
+        return 1
+    }
+    if b_opt is some _ {
+        return -1
+    }
+    return str.cmp(a, b)
+}
+
+/// Copy a validated version into the allocator, adding the canonical `v` prefix.
+pub fn canonical[A: allocators.GeneralAllocator](
+    ac: A,
+    raw: str.StringView
+) option[ref u8] = trust {
+    pre {
+        raw_valid: raw.ptr != none || raw.len == 0
+    }
+    val t: str.StringView = str.trim(raw)
+    if t.len == 0 {
+        return none
+    }
+    match parse(t) {
+        none => {
+            return none
+        }
+        some _ => {
+        }
+    }
+
+    val has_v: bool = @load8(t.ptr) == 118
+    val prefix: mut i64 = 1
+    if has_v {
+        prefix = 0
+    }
+    val out_len: i64 = t.len + prefix
+    val raw_opt = allocators.alloc_in[A](ac, (out_len + 1) as usize)
+    match raw_opt {
+        none => {
+            return none
+        }
+        some raw_out => {
+            val out: ref u8 = raw_out as ref u8
+            val offset: mut i64 = 0
+            if !has_v {
+                @store8(out, 118)
+                offset = 1
+            }
+            if t.len > 0 {
+                @memcpy(@ptradd(out, offset), t.ptr as ref void, t.len as usize)
+            }
+            @store8(@ptradd(out, out_len), 0)
+            return some out
+        }
+    }
+}
+
+/// Sort version strings newest-first in place.
+pub fn sort_desc(items: mut list[ref u8]) void = trust {
+    val n: i64 = @len(items) as i64
+    val i: mut i64 = 0
+    for i < n {
+        val j: mut i64 = i + 1
+        for j < n {
+            val a_opt = @get(items, i as usize)
+            val b_opt = @get(items, j as usize)
+            if a_opt is some a_raw {
+                if b_opt is some b_raw {
+                    val a: ref u8 = a_raw as ref u8
+                    val b: ref u8 = b_raw as ref u8
+                    if cmp_text(str.from_cstr(a), str.from_cstr(b)) < 0 {
+                        @set(items, i as usize, b)
+                        @set(items, j as usize, a)
+                    }
+                }
+            }
+            j++
+        }
+        i++
+    }
+}

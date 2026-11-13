@@ -1,0 +1,173 @@
+/// Allocation and shell helpers shared by the svm modules.
+
+val allocators = use("std/allocators")
+val str        = use("std/string")
+
+/// A fixed-capacity, allocator-backed byte buffer for command lines and paths.
+pub type Buf = {
+    ptr: mut ref u8
+    len: mut i64
+    cap: mut i64
+}
+
+pub fn buf_new[A: allocators.GeneralAllocator](ac: A, cap: i64) Buf = trust {
+    pre {
+        positive_capacity: cap > 0
+    }
+    val raw_opt = allocators.alloc_in[A](ac, (cap + 1) as usize)
+    match raw_opt {
+        none => {
+            return Buf{ptr: none, len: 0, cap: 0}
+        }
+        some raw => {
+            val ptr: ref u8 = raw as ref u8
+            @store8(ptr, 0)
+            return Buf{ptr: ptr, len: 0, cap: cap}
+        }
+    }
+}
+
+pub fn buf_ok(buf: Buf) bool = {
+    return buf.ptr != none
+}
+
+pub fn buf_view(buf: Buf) str.StringView = {
+    return str.view(buf.ptr, buf.len)
+}
+
+pub fn buf_cstr(buf: Buf) ref u8 = trust {
+    if buf.ptr != none {
+        @store8(@ptradd(buf.ptr, buf.len), 0)
+    }
+    return buf.ptr
+}
+
+pub fn buf_append(buf: mut Buf, text: str.StringView) void = trust {
+    pre {
+        text_valid: text.ptr != none || text.len == 0
+    }
+    if buf.ptr == none || text.len <= 0 {
+        return
+    }
+    val room: i64 = buf.cap - buf.len
+    val count: mut i64 = text.len
+    if count > room {
+        count = room
+    }
+    if count <= 0 {
+        return
+    }
+    @memcpy(
+        @ptradd(buf.ptr, buf.len),
+        text.ptr as ref void,
+        count as usize
+    )
+    buf.len += count
+    @store8(@ptradd(buf.ptr, buf.len), 0)
+}
+
+pub fn buf_append_cstr(buf: mut Buf, text: ref u8) void = trust {
+    if text == none {
+        return
+    }
+    buf_append(buf, str.from_cstr(text))
+}
+
+pub fn buf_append_char(buf: mut Buf, c: u8) void = trust {
+    if buf.ptr == none || buf.len >= buf.cap {
+        return
+    }
+    @store8(@ptradd(buf.ptr, buf.len), c)
+    buf.len++
+    @store8(@ptradd(buf.ptr, buf.len), 0)
+}
+
+pub fn buf_append_i64(buf: mut Buf, value: i64) void = trust {
+    if value == 0 {
+        buf_append_char(buf, 48)
+        return
+    }
+    val negative: bool = value < 0
+    val digits: [24]u8 = @zeroed
+    val n: mut i64 = 0
+    val work: mut u64 = value as u64
+    if negative {
+        work = (0 as u64) - (value as u64)
+    }
+    for {
+        if work == (0 as u64) {
+            break
+        }
+        val digit: u8 = (work % (10 as u64)) as u8
+        @store8(@ptradd(digits as ref u8, n), digit + 48)
+        work = work / (10 as u64)
+        n++
+    }
+    if negative {
+        buf_append_char(buf, 45)
+    }
+    val i: mut i64 = n
+    for i > 0 {
+        i--
+        val c: u8 = @load8(@ptradd(digits as ref u8, i))
+        buf_append_char(buf, c)
+    }
+}
+
+/// Quote a string for safe interpolation into a POSIX shell command.
+///
+/// Single quotes are escaped with the standard `'\''` sequence.
+pub fn quote[A: allocators.GeneralAllocator](
+    ac: A,
+    text: str.StringView
+) ref u8 = trust {
+    pre {
+        text_valid: text.ptr != none || text.len == 0
+    }
+    val extra: mut i64 = 0
+    val i: mut i64 = 0
+    for {
+        if i >= text.len {
+            break
+        }
+        if @load8(@ptradd(text.ptr, i)) == 39 {
+            extra += 3
+        }
+        i++
+    }
+
+    val out_len: i64 = text.len + extra + 2
+    val raw_opt = allocators.alloc_in[A](ac, (out_len + 1) as usize)
+    match raw_opt {
+        none => {
+            return none
+        }
+        some raw => {
+            val out: ref u8 = raw as ref u8
+            val w: mut i64 = 0
+            @store8(out, 39)
+            w = 1
+            i = 0
+            for {
+                if i >= text.len {
+                    break
+                }
+                val c: u8 = @load8(@ptradd(text.ptr, i))
+                if c == 39 {
+                    @store8(@ptradd(out, w), 39)
+                    @store8(@ptradd(out, w + 1), 92)
+                    @store8(@ptradd(out, w + 2), 39)
+                    @store8(@ptradd(out, w + 3), 39)
+                    w += 4
+                } else {
+                    @store8(@ptradd(out, w), c)
+                    w++
+                }
+                i++
+            }
+            @store8(@ptradd(out, w), 39)
+            @store8(@ptradd(out, w + 1), 0)
+            return out
+        }
+    }
+}
